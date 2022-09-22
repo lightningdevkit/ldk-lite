@@ -495,7 +495,7 @@ impl LdkLite {
 				// fifth round.
 				if rounds == 0 {
 					let now = Instant::now();
-					match chain_access.sync_wallet() {
+					match chain_access.sync_wallet().await {
 						Ok(()) => log_info!(
 							sync_logger,
 							"On-chain wallet sync finished in {}ms.",
@@ -511,7 +511,7 @@ impl LdkLite {
 					&*sync_cmon as &(dyn Confirm + Sync),
 				];
 				let now = Instant::now();
-				match chain_access.sync(confirmables) {
+				match chain_access.sync(confirmables).await {
 					Ok(()) => log_info!(
 						sync_logger,
 						"Lightning wallet sync finished in {}ms.",
