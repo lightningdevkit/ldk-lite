@@ -1,19 +1,15 @@
 use crate::error::LdkLiteError as Error;
 
-use crate::{FilesystemLogger, LdkLiteConfig, NetworkGraph, PeerInfo, Scorer};
+use crate::payment_store::{PaymentInfo, PAYMENT_INFO_PERSISTENCE_PREFIX};
+use crate::{FilesystemLogger, LdkLiteConfig, NetworkGraph, Scorer};
 
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringParameters};
-use lightning::util::ser::ReadableArgs;
-
-use bitcoin::secp256k1::PublicKey;
+use lightning::util::ser::{Readable, ReadableArgs};
 
 use rand::{thread_rng, RngCore};
 
-use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::SocketAddr;
+use std::io::{BufReader, Write};
 use std::sync::Arc;
 
 pub(crate) fn read_or_generate_seed_file(config: Arc<LdkLiteConfig>) -> Result<[u8; 32], Error> {
@@ -67,4 +63,23 @@ pub(crate) fn read_scorer(
 		}
 	}
 	ProbabilisticScorer::new(params, network_graph, logger)
+}
+
+pub(crate) fn read_payment_info(config: Arc<LdkLiteConfig>) -> Result<Vec<PaymentInfo>, Error> {
+	let ldk_data_dir = format!("{}/ldk", &config.storage_dir_path.clone());
+	let payment_store_path =
+		format!("{}/{}", ldk_data_dir.clone(), PAYMENT_INFO_PERSISTENCE_PREFIX);
+	let mut payments = Vec::new();
+
+	for entry in fs::read_dir(payment_store_path)? {
+		let entry = entry?;
+		if entry.path().is_file() {
+			let mut f = fs::File::open(entry.path())?;
+			if let Ok(payment_info) = PaymentInfo::read(&mut f) {
+				payments.push(payment_info);
+			}
+		}
+	}
+
+	Ok(payments)
 }

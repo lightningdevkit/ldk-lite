@@ -30,12 +30,15 @@ mod event;
 mod hex_utils;
 mod io_utils;
 mod logger;
+mod payment_store;
 mod peer_store;
 
 use access::LdkLiteChainAccess;
 pub use error::LdkLiteError as Error;
 pub use event::LdkLiteEvent;
 use event::{LdkLiteEventHandler, LdkLiteEventQueue};
+use payment_store::PaymentInfoStorage;
+pub use payment_store::{PaymentDirection, PaymentInfo, PaymentStatus};
 use peer_store::{PeerInfo, PeerInfoStorage};
 
 #[allow(unused_imports)]
@@ -51,7 +54,7 @@ use lightning::ln::channelmanager::{
 	ChainParameters, ChannelManagerReadArgs, SimpleArcChannelManager,
 };
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
-use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip;
 use lightning::routing::gossip::P2PGossipSync;
 use lightning::routing::scoring::ProbabilisticScorer;
@@ -81,7 +84,6 @@ use bitcoin::BlockHash;
 
 use rand::Rng;
 
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
 use std::net::SocketAddr;
@@ -330,9 +332,9 @@ impl LdkLiteBuilder {
 		)));
 
 		// Step 13: Init payment info storage
-		// TODO: persist payment info to disk
-		let inbound_payments = Arc::new(Mutex::new(HashMap::new()));
-		let outbound_payments = Arc::new(Mutex::new(HashMap::new()));
+		let payments = io_utils::read_payment_info(Arc::clone(&config))?;
+		let payment_store =
+			Arc::new(PaymentInfoStorage::from_payments(payments, Arc::clone(&persister)));
 
 		// Step 14: Restore event handler from disk or create a new one.
 		let event_queue = if let Ok(mut f) =
@@ -349,8 +351,7 @@ impl LdkLiteBuilder {
 			Arc::clone(&channel_manager),
 			Arc::clone(&network_graph),
 			Arc::clone(&keys_manager),
-			Arc::clone(&inbound_payments),
-			Arc::clone(&outbound_payments),
+			Arc::clone(&payment_store),
 			Arc::clone(&logger),
 			Arc::clone(&config),
 		);
@@ -397,9 +398,8 @@ impl LdkLiteBuilder {
 			logger,
 			scorer,
 			invoice_payer,
-			inbound_payments,
-			outbound_payments,
 			peer_store,
+			payment_store,
 		})
 	}
 }
@@ -430,9 +430,8 @@ pub struct LdkLite {
 	logger: Arc<FilesystemLogger>,
 	scorer: Arc<Mutex<Scorer>>,
 	invoice_payer: Arc<InvoicePayer<LdkLiteEventHandler>>,
-	inbound_payments: Arc<PaymentInfoStorage>,
-	outbound_payments: Arc<PaymentInfoStorage>,
 	peer_store: Arc<PeerInfoStorage<FilesystemPersister>>,
+	payment_store: Arc<PaymentInfoStorage<FilesystemPersister>>,
 }
 
 impl LdkLite {
@@ -721,7 +720,12 @@ impl LdkLite {
 			return Err(Error::NotRunning);
 		}
 
-		// TODO: ensure we never tried paying the given payment hash before
+		let payment_hash = PaymentHash(invoice.payment_hash().clone().into_inner());
+		if self.payment_store.contains_payment(&payment_hash) {
+			log_error!(self.logger, "Payment error: an invoice must not get payed twice.");
+			return Err(Error::NonUniquePaymentHash);
+		}
+
 		let status = match self.invoice_payer.pay_invoice(&invoice) {
 			Ok(_payment_id) => {
 				let payee_pubkey = invoice.recover_payee_pub_key();
@@ -729,36 +733,35 @@ impl LdkLite {
 				// succeed? Should we allow to set the amount in the interface or via a dedicated
 				// method?
 				let amt_msat = invoice.amount_milli_satoshis().unwrap();
-				log_info!(self.logger, "initiated sending {} msats to {}", amt_msat, payee_pubkey);
+				log_info!(self.logger, "Initiated sending {} msats to {}", amt_msat, payee_pubkey);
 				PaymentStatus::Pending
 			}
 			Err(payment::PaymentError::Invoice(e)) => {
-				log_error!(self.logger, "invalid invoice: {}", e);
+				log_error!(self.logger, "Payment error: invalid invoice: {}", e);
 				return Err(Error::LdkPayment(payment::PaymentError::Invoice(e)));
 			}
 			Err(payment::PaymentError::Routing(e)) => {
-				log_error!(self.logger, "failed to find route: {}", e.err);
+				log_error!(self.logger, "Payment error: failed to find route: {}", e.err);
 				return Err(Error::LdkPayment(payment::PaymentError::Routing(e)));
 			}
 			Err(payment::PaymentError::Sending(e)) => {
-				log_error!(self.logger, "failed to send payment: {:?}", e);
+				log_error!(self.logger, "Payment error: failed to send payment: {:?}", e);
 				PaymentStatus::Failed
 			}
 		};
 
-		let payment_hash = PaymentHash(invoice.payment_hash().clone().into_inner());
 		let payment_secret = Some(invoice.payment_secret().clone());
 
-		let mut outbound_payments_lock = self.outbound_payments.lock().unwrap();
-		outbound_payments_lock.insert(
-			payment_hash,
-			PaymentInfo {
-				preimage: None,
-				secret: payment_secret,
-				status,
-				amount_msat: invoice.amount_milli_satoshis(),
-			},
-		);
+		let payment_info = PaymentInfo {
+			preimage: None,
+			hash: payment_hash,
+			secret: payment_secret,
+			amount_msat: invoice.amount_milli_satoshis(),
+			direction: PaymentDirection::Outbound,
+			status,
+		};
+
+		self.payment_store.insert_payment(payment_info)?;
 
 		Ok(payment_hash)
 	}
@@ -801,11 +804,15 @@ impl LdkLite {
 			}
 		};
 
-		let mut outbound_payments_lock = self.outbound_payments.lock().unwrap();
-		outbound_payments_lock.insert(
-			payment_hash,
-			PaymentInfo { preimage: None, secret: None, status, amount_msat: Some(amount_msat) },
-		);
+		let payment_info = PaymentInfo {
+			preimage: None,
+			hash: payment_hash,
+			secret: None,
+			amount_msat: Some(amount_msat),
+			direction: PaymentDirection::Outbound,
+			status,
+		};
+		self.payment_store.insert_payment(payment_info)?;
 
 		Ok(payment_hash)
 	}
@@ -814,8 +821,6 @@ impl LdkLite {
 	pub fn receive_payment(
 		&self, amount_msat: Option<u64>, description: &str, expiry_secs: u32,
 	) -> Result<Invoice, Error> {
-		let mut inbound_payments_lock = self.inbound_payments.lock().unwrap();
-
 		let currency = match self.config.network {
 			bitcoin::Network::Bitcoin => Currency::Bitcoin,
 			bitcoin::Network::Testnet => Currency::BitcoinTestnet,
@@ -843,37 +848,24 @@ impl LdkLite {
 		};
 
 		let payment_hash = PaymentHash(invoice.payment_hash().clone().into_inner());
-		inbound_payments_lock.insert(
-			payment_hash,
-			PaymentInfo {
-				preimage: None,
-				secret: Some(invoice.payment_secret().clone()),
-				status: PaymentStatus::Pending,
-				amount_msat,
-			},
-		);
+		let payment_info = PaymentInfo {
+			preimage: None,
+			hash: payment_hash,
+			secret: Some(invoice.payment_secret().clone()),
+			amount_msat,
+			direction: PaymentDirection::Inbound,
+			status: PaymentStatus::Pending,
+		};
+
+		self.payment_store.insert_payment(payment_info)?;
+
 		Ok(invoice)
 	}
 
 	///	Query for information about the status of a specific payment.
 	pub fn payment_info(&self, payment_hash: &[u8; 32]) -> Option<PaymentInfo> {
 		let payment_hash = PaymentHash(*payment_hash);
-
-		{
-			let outbound_payments_lock = self.outbound_payments.lock().unwrap();
-			if let Some(payment_info) = outbound_payments_lock.get(&payment_hash) {
-				return Some((*payment_info).clone());
-			}
-		}
-
-		{
-			let inbound_payments_lock = self.inbound_payments.lock().unwrap();
-			if let Some(payment_info) = inbound_payments_lock.get(&payment_hash) {
-				return Some((*payment_info).clone());
-			}
-		}
-
-		None
+		self.payment_store.payment(&payment_hash)
 	}
 }
 
@@ -921,34 +913,6 @@ async fn do_connect_peer(
 	}
 }
 
-//
-// Structs wrapping the particular information which should easily be
-// understandable, parseable, and transformable, i.e., we'll try to avoid
-// exposing too many technical detail here.
-/// Represents a payment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PaymentInfo {
-	/// The pre-image used by the payment.
-	pub preimage: Option<PaymentPreimage>,
-	/// The secret used by the payment.
-	pub secret: Option<PaymentSecret>,
-	/// The status of the payment.
-	pub status: PaymentStatus,
-	/// The amount transferred.
-	pub amount_msat: Option<u64>,
-}
-
-/// Represents the current status of a payment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PaymentStatus {
-	/// The payment is still pending.
-	Pending,
-	/// The payment suceeded.
-	Succeeded,
-	/// The payment failed.
-	Failed,
-}
-
 type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
 	Arc<dyn Filter + Send + Sync>,
@@ -989,8 +953,6 @@ type GossipSync =
 	P2PGossipSync<Arc<NetworkGraph>, Arc<dyn Access + Send + Sync>, Arc<FilesystemLogger>>;
 
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
-
-pub(crate) type PaymentInfoStorage = Mutex<HashMap<PaymentHash, PaymentInfo>>;
 
 #[cfg(test)]
 mod tests {}

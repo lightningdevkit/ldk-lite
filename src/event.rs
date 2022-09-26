@@ -1,6 +1,6 @@
 use crate::{
 	hex_utils, ChannelManager, Error, FilesystemPersister, LdkLiteChainAccess, LdkLiteConfig,
-	NetworkGraph, PaymentInfo, PaymentInfoStorage, PaymentStatus,
+	NetworkGraph, PaymentDirection, PaymentInfo, PaymentInfoStorage, PaymentStatus,
 };
 
 #[allow(unused_imports)]
@@ -232,8 +232,7 @@ pub(crate) struct LdkLiteEventHandler {
 	channel_manager: Arc<ChannelManager>,
 	network_graph: Arc<NetworkGraph>,
 	keys_manager: Arc<KeysManager>,
-	inbound_payments: Arc<PaymentInfoStorage>,
-	outbound_payments: Arc<PaymentInfoStorage>,
+	payment_store: Arc<PaymentInfoStorage<FilesystemPersister>>,
 	logger: Arc<FilesystemLogger>,
 	_config: Arc<LdkLiteConfig>,
 }
@@ -243,8 +242,8 @@ impl LdkLiteEventHandler {
 		chain_access: Arc<LdkLiteChainAccess<bdk::sled::Tree>>,
 		event_queue: Arc<LdkLiteEventQueue<FilesystemPersister>>,
 		channel_manager: Arc<ChannelManager>, network_graph: Arc<NetworkGraph>,
-		keys_manager: Arc<KeysManager>, inbound_payments: Arc<PaymentInfoStorage>,
-		outbound_payments: Arc<PaymentInfoStorage>, logger: Arc<FilesystemLogger>,
+		keys_manager: Arc<KeysManager>,
+		payment_store: Arc<PaymentInfoStorage<FilesystemPersister>>, logger: Arc<FilesystemLogger>,
 		_config: Arc<LdkLiteConfig>,
 	) -> Self {
 		Self {
@@ -253,8 +252,7 @@ impl LdkLiteEventHandler {
 			channel_manager,
 			network_graph,
 			keys_manager,
-			inbound_payments,
-			outbound_payments,
+			payment_store,
 			logger,
 			_config,
 		}
@@ -339,23 +337,25 @@ impl ldk_events::EventHandler for LdkLiteEventHandler {
 						(Some(*preimage), None)
 					}
 				};
-				let mut payments = self.inbound_payments.lock().unwrap();
-				match payments.entry(*payment_hash) {
-					hash_map::Entry::Occupied(mut e) => {
-						let payment = e.get_mut();
-						payment.status = PaymentStatus::Succeeded;
-						payment.preimage = payment_preimage;
-						payment.secret = payment_secret;
-					}
-					hash_map::Entry::Vacant(e) => {
-						e.insert(PaymentInfo {
+
+				let payment_info =
+					if let Some(mut payment_info) = self.payment_store.payment(payment_hash) {
+						payment_info.status = PaymentStatus::Succeeded;
+						payment_info.preimage = payment_preimage;
+						payment_info.secret = payment_secret;
+						payment_info
+					} else {
+						PaymentInfo {
 							preimage: payment_preimage,
+							hash: *payment_hash,
 							secret: payment_secret,
-							status: PaymentStatus::Succeeded,
 							amount_msat: Some(*amount_msat),
-						});
-					}
-				}
+							direction: PaymentDirection::Inbound,
+							status: PaymentStatus::Succeeded,
+						}
+					};
+
+				self.payment_store.insert_payment(payment_info).unwrap();
 			}
 			ldk_events::Event::PaymentSent {
 				payment_preimage,
@@ -363,25 +363,23 @@ impl ldk_events::EventHandler for LdkLiteEventHandler {
 				fee_paid_msat,
 				..
 			} => {
-				let mut payments = self.outbound_payments.lock().unwrap();
-				for (hash, payment) in payments.iter_mut() {
-					if *hash == *payment_hash {
-						payment.preimage = Some(*payment_preimage);
-						payment.status = PaymentStatus::Succeeded;
-						log_info!(
-							self.logger,
-							"Successfully sent payment of {} millisatoshis{} from \
-								 payment hash {:?} with preimage {:?}",
-							payment.amount_msat.unwrap(),
-							if let Some(fee) = fee_paid_msat {
-								format!(" (fee {} msat)", fee)
-							} else {
-								"".to_string()
-							},
-							hex_utils::to_string(&payment_hash.0),
-							hex_utils::to_string(&payment_preimage.0)
-						);
-					}
+				if let Some(mut payment_info) = self.payment_store.payment(payment_hash) {
+					payment_info.preimage = Some(*payment_preimage);
+					payment_info.status = PaymentStatus::Succeeded;
+					self.payment_store.insert_payment(payment_info.clone()).unwrap();
+					log_info!(
+						self.logger,
+						"Successfully sent payment of {} millisatoshis{} from \
+						payment hash {:?} with preimage {:?}",
+						payment_info.amount_msat.unwrap(),
+						if let Some(fee) = fee_paid_msat {
+							format!(" (fee {} msat)", fee)
+						} else {
+							"".to_string()
+						},
+						hex_utils::to_string(&payment_hash.0),
+						hex_utils::to_string(&payment_preimage.0)
+					);
 				}
 				self.event_queue
 					.add_event(LdkLiteEvent::PaymentSuccessful {
@@ -397,11 +395,7 @@ impl ldk_events::EventHandler for LdkLiteEventHandler {
 					hex_utils::to_string(&payment_hash.0)
 				);
 
-				let mut payments = self.outbound_payments.lock().unwrap();
-				if payments.contains_key(&payment_hash) {
-					let payment = payments.get_mut(&payment_hash).unwrap();
-					payment.status = PaymentStatus::Failed;
-				}
+				self.payment_store.set_payment_status(payment_hash, PaymentStatus::Failed).unwrap();
 				self.event_queue
 					.add_event(LdkLiteEvent::PaymentFailed {
 						payment_hash: *payment_hash,
@@ -409,7 +403,6 @@ impl ldk_events::EventHandler for LdkLiteEventHandler {
 					})
 					.unwrap();
 			}
-
 			ldk_events::Event::PaymentPathSuccessful { .. } => {}
 			ldk_events::Event::PaymentPathFailed { .. } => {}
 			ldk_events::Event::ProbeSuccessful { .. } => {}
