@@ -1,4 +1,5 @@
 use crate::hex_utils;
+use crate::io_utils::KVStoreUnpersister;
 use crate::Error;
 
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
@@ -123,12 +124,12 @@ impl Writeable for PaymentStatus {
 /// The payment information will be persisted under this prefix.
 pub(crate) const PAYMENT_INFO_PERSISTENCE_PREFIX: &str = "payments";
 
-pub(crate) struct PaymentInfoStorage<K: KVStorePersister> {
+pub(crate) struct PaymentInfoStorage<K: KVStorePersister + KVStoreUnpersister> {
 	payments: Mutex<HashMap<PaymentHash, PaymentInfo>>,
 	persister: Arc<K>,
 }
 
-impl<K: KVStorePersister> PaymentInfoStorage<K> {
+impl<K: KVStorePersister + KVStoreUnpersister> PaymentInfoStorage<K> {
 	pub(crate) fn new(persister: Arc<K>) -> Self {
 		let payments = Mutex::new(HashMap::new());
 		Self { payments, persister }
@@ -157,9 +158,15 @@ impl<K: KVStorePersister> PaymentInfoStorage<K> {
 		return Ok(());
 	}
 
-	// TODO: Need an `unpersist` method for this?
-	//pub(crate) fn remove_payment(&self, payment_hash: &PaymentHash) -> Result<(), Error> {
-	//}
+	pub(crate) fn remove_payment(&self, payment_hash: &PaymentHash) -> Result<(), Error> {
+		let key = format!(
+			"{}/{}",
+			PAYMENT_INFO_PERSISTENCE_PREFIX,
+			hex_utils::to_string(&payment_hash.0)
+		);
+		self.persister.unpersist(&key)?;
+		Ok(())
+	}
 
 	pub(crate) fn payment(&self, payment_hash: &PaymentHash) -> Option<PaymentInfo> {
 		self.payments.lock().unwrap().get(payment_hash).cloned()
